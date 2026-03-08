@@ -1,0 +1,169 @@
+Step 1: Environment Setup
+
+Install dependencies:textpip install streamlit grokclient gtts sqlite3
+Get a Grok API key from xAI (or use OpenAI if preferred).
+For other LLMs, adjust the client.
+
+Project Structure:textchatbot/
+├── app.py              # Streamlit frontend + backend logic
+├── db.py               # SQLite helpers for history/streaks/analytics
+├── llm_prompts.py      # System prompts for codemixed responses
+├── assets/             # For audio files (temporary)
+└── requirements.txt
+
+Step 2: Core Chatbot Logic (Python Backend)
+We'll use a system prompt to handle codemixed input (Hinglish/Tanglish), detect intent, respond in the same style, and scope to NCERT.
+In llm_prompts.py:
+PythonCORE_PROMPT = """
+You are a helpful senior student explaining NCERT Class 9-10 Science and Math concepts in the same codemixed language the user used (Hinglish or Tanglish). Respond like a bhaiya/didi: casual, friendly, not textbook formal. Use Indian examples like cricket for physics, dal-chawal for chemistry.
+
+- Understand intent even if mixed: e.g., 'bhaiya yeh photosynthesis wala concept samajh nahi aaya' → Explain photosynthesis simply.
+- Stay in scope: Only NCERT Class 9-10. Politely decline others: 'Sorry yaar, main sirf Class 9-10 Science aur Math pe focus karta hoon.'
+- Keep tone grade-appropriate: Simple, with analogies.
+- After explanation, add a text-based concept map: e.g., 'Concept Map: Photosynthesis → Connected to: Respiration (energy cycle), Carbon Cycle (environment), Plant Nutrition (biology basics)'
+- If repeated questions on same topic (I'll tell you history), switch to simpler: Use more analogies, real-life examples, describe diagrams in words.
+
+User question: {question}
+History: {history}  # For adaptive difficulty
+"""
+In app.py (core LLM call):
+Pythonimport os
+from grokclient import GrokClient  # Or openai.OpenAI
+from gtts import gTTS
+
+os.environ['GROK_API_KEY'] = 'your_key_here'
+client = GrokClient()
+
+def get_llm_response(question, history=""):
+    prompt = CORE_PROMPT.format(question=question, history=history)
+    response = client.chat.completions.create(
+        model="grok-beta",  # Or 'gpt-4o' for OpenAI
+        messages=[{"role": "system", "content": prompt}],
+        max_tokens=500
+    )
+    return response.choices[0].message.content
+
+def generate_voice(text):
+    tts = gTTS(text=text, lang='hi' if 'hindi' in text.lower() else 'ta')  # Detect Hinglish vs Tanglish roughly
+    audio_file = "assets/response.mp3"
+    tts.save(audio_file)
+    return audio_file
+Step 3: Database for Persistence (db.py)
+Use SQLite for session history (adaptive difficulty), streaks, and teacher analytics.
+Pythonimport sqlite3
+from datetime import datetime, timedelta
+
+conn = sqlite3.connect('chatbot.db')
+cursor = conn.cursor()
+
+# Setup tables
+cursor.execute('''CREATE TABLE IF NOT EXISTS user_history (user_id TEXT, topic TEXT, timestamp DATETIME)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS streaks (user_id TEXT, streak INT, last_date DATE)''')
+conn.commit()
+
+def add_question(user_id, topic):
+    cursor.execute("INSERT INTO user_history VALUES (?, ?, ?)", (user_id, topic, datetime.now()))
+    conn.commit()
+
+def get_history(user_id, topic):
+    cursor.execute("SELECT COUNT(*) FROM user_history WHERE user_id=? AND topic=? AND timestamp > ?", 
+                   (user_id, topic, datetime.now() - timedelta(days=7)))
+    return cursor.fetchone()[0]
+
+def update_streak(user_id):
+    today = datetime.now().date()
+    cursor.execute("SELECT streak, last_date FROM streaks WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if row:
+        streak, last_date = row
+        last_date = datetime.strptime(last_date, '%Y-%m-%d').date()
+        if today == last_date + timedelta(days=1):
+            streak += 1
+        elif today > last_date + timedelta(days=1):
+            streak = 1
+    else:
+        streak = 1
+    cursor.execute("REPLACE INTO streaks VALUES (?, ?, ?)", (user_id, streak, today.strftime('%Y-%m-%d')))
+    conn.commit()
+    return streak
+
+def get_top_topics(week_offset=0):
+    start = datetime.now() - timedelta(days=7 + week_offset*7)
+    cursor.execute("SELECT topic, COUNT(*) FROM user_history WHERE timestamp > ? GROUP BY topic ORDER BY COUNT(*) DESC LIMIT 5", (start,))
+    return cursor.fetchall()
+Step 4: Enhanced Features
+
+Adaptive Difficulty: In LLM call, if get_history(user_id, topic) > 2, append to prompt: "User asked this topic repeatedly. Use simpler analogies and examples."
+Concept Map: Baked into core prompt; LLM generates simple ASCII art or bullet list.
+Practice Question Generator: After core response, call LLM with:PythonPRACTICE_PROMPT = """
+Generate 3 NCERT-aligned practice questions on {topic}: 1 easy, 1 medium, 1 hard. In codemixed style.
+Easy: Basic recall.
+Medium: Application.
+Hard: Multi-concept.
+"""
+# Call get_llm_response(PRACTICE_PROMPT.format(topic=topic))
+Mistake Analyser: Separate input field. Prompt:PythonMISTAKE_PROMPT = """
+Student got this wrong: {wrong_answer}. Correct concept from NCERT: Explain mistake casually, then correct reasoning.
+"""
+Study Streak Tracker: On chat, check if questions today >=3, update streak. Display: "Your streak: {streak} days 🔥"
+Teacher Mode: Password-protected page (simple Streamlit secret). Show bar chart of top topics via matplotlib (save as image, display).
+
+Step 5: Frontend with Streamlit (app.py continued)
+Streamlit for chat interface, voice button, dashboard.
+Pythonimport streamlit as st
+from db import *  # Import all helpers
+
+st.title("Doubt-Clearing Chatbot for NCERT Students")
+
+# User ID (session or login)
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = st.text_input("Enter your name or ID:")
+user_id = st.session_state.user_id
+
+# Teacher Mode
+if st.sidebar.checkbox("Teacher Mode"):
+    password = st.sidebar.text_input("Password", type="password")
+    if password == "teacher123":  # Hardcode for demo
+        st.subheader("Weekly Analytics")
+        top_topics = get_top_topics()
+        st.write("Top asked topics this week:")
+        for topic, count in top_topics:
+            st.write(f"{topic}: {count} questions")
+        # Add matplotlib bar chart here
+
+# Main Chat
+question = st.text_input("Ask your doubt in Hinglish/Tanglish:")
+if question:
+    # Detect topic roughly (use LLM or keywords)
+    topic = question.lower().split()[0] if 'wala' in question else "general"  # Improve with LLM
+    add_question(user_id, topic)
+    
+    history_count = get_history(user_id, topic)
+    history = f"Repeated {history_count} times." if history_count > 0 else ""
+    
+    response = get_llm_response(question, history)
+    st.write(response)
+    
+    # Voice
+    audio = generate_voice(response)
+    st.audio(audio)
+    
+    # Practice Questions
+    practice = get_llm_response(PRACTICE_PROMPT.format(topic=topic))
+    st.subheader("Practice Questions")
+    st.write(practice)
+    
+    # Update streak if questions today >=3
+    # Query db for today's count, then update_streak if >=3
+
+# Mistake Analyser
+st.subheader("Mistake Analyser")
+wrong_answer = st.text_area("Paste your wrong answer:")
+if wrong_answer:
+    mistake_response = get_llm_response(MISTAKE_PROMPT.format(wrong_answer=wrong_answer))
+    st.write(mistake_response)
+
+# Streak Dashboard
+st.sidebar.subheader("Your Progress")
+streak = update_streak(user_id)  # Call conditionally if questions >=3
+st.sidebar.write(f"Streak: {streak} days")
